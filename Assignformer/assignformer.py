@@ -102,4 +102,54 @@ class assignformer(nn.Module):
 			heads
 		)
 		
+"""
+
+O := L x 4 obs peaks
+P := L x 4 predicted peaks
+
+which of the rows match
+
+
+make new embeddings of obs peaks
+L x d
+4 numbers that describe the peak -> new vector size d
+
+O -> O'
+P -> P'
+
+O', P' -> O'', P''
+
+qkv
+
+L x d -> Q matrix L x dq
+K L x dq
+V L x dv
+
+calculate attention
+between all rows in the obs peaks matrix
+
+
+Assignformer layer
+1. MHSA on observed peaks
+2. MHSA on pred peaks
+3. MHSA between obs peaks and predicted
+
+L layer times
+
+prediction
+
+L L matrix for every row is the networks belief that observed peak i is assigned to predicted peak j
+
+
+over the layers of the network I am trying the network to refine a representation of the assignment
+
+
+AF2 structure module
+attention between residues in space
+
+Np x Np attn matrix --> into the O representation
+
+Np x Np attn matrix --> learnable layer to push the matrix L x d
+
+"""
 		
