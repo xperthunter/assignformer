@@ -2,11 +2,13 @@
 import json
 import matplotlib.pyplot as plt
 import sys
+import warnings
 
+from pytablewriter import MarkdownTableWriter
+from pytablewriter.style import Style
+from numba import njit
 import numpy as np
 import pandas as pd
-
-np.set_printoptions(threshold=sys.maxsize)
 
 
 def rc_models(data=None, index=None):
@@ -35,7 +37,6 @@ def seq_models(data=None, index=None):
 			if peaks[i][index] is np.ma.masked: continue
 			
 			aa_prev = seqs[i-1]
-			#print(aa_prev, aa)
 			if aa_prev not in model:     model[aa_prev]     = dict()
 			if aa not in model[aa_prev]: model[aa_prev][aa] = list()
 			
@@ -57,7 +58,11 @@ def make_predictions(data=None, index=None, model_rc=None, model_seq=None):
 	assert(model_rc != None)
 	assert(model_seq != None)
 	
-	for i, (preds, seqs) in enumerate(zip(data.predictions.tolist(), data.seq.tolist())):
+	for i, (preds, seqs) in enumerate(
+		zip(
+			data.predictions.tolist(),
+			data.seq.tolist())):
+		
 		for j, aa in enumerate(seqs):
 			if j == 0: 
 				data['seq_preds'][i][j][index] = model_rc[0]
@@ -88,18 +93,25 @@ def metric(obs, pred, scale=dict()):
 			continue
 		count += 1
 		dis += ((o - p)/scale[i])**2
-		
-	dis = np.sqrt(dis) / count
+	
+	if count == 0: dis = np.nan	
+	else:          dis = np.sqrt(dis) / count
 	
 	return dis
 
 
-def metric_matrix(obss, preds, scale=None):
+def metric_matrix(observed, preds, scale=None):
 	
-	matrix = np.ma.array(np.zeros((obss.shape[0], preds.shape[0])),
-		mask=np.zeros((obss.shape[0],preds.shape[0])))
+	matrix = np.ma.array(
+		np.zeros(
+			(observed.shape[0], preds.shape[0])
+		),
+		mask=np.zeros(
+			(observed.shape[0],preds.shape[0])
+		)
+	)
 	
-	for i, obs in enumerate(obss):
+	for i, obs in enumerate(observed):
 		masked = obs.mask.sum()
 		if masked == 4:
 			matrix[i,:] = np.ma.masked
@@ -109,27 +121,58 @@ def metric_matrix(obss, preds, scale=None):
 			matrix[i, j] = metric(obs, pred, scale=scale)
 	
 	return matrix
-		
 
-def two_step(row=None, matrix=None, row_i=None):
+
+@njit()
+def numba_for_loop(x,y):
+	m = x.shape[0]
+	k = y.shape[0]
+	D = np.zeros((m,k))
+	
+	for i in range(m):
+		for j in range(k):
+			dis   = 0
+			count = 0
+			for o, p in zip(x[i,:], y[j,:]):
+				if np.isnan(o) or np.isnan(p):
+					dis += 0.0
+					continue
+				if o == -np.inf:
+					dis += 0.0
+					continue
+				count += 1
+				dis += ((o - p))**2
+			
+			if count == 0: D[i, j] = np.nan
+			else:          D[i, j] = np.sqrt(dis) / count
+	
+	return D
+
+
+def scale_shifts(shifts, scale):
+	scales = np.tile(scale, (shifts.shape[0], 1))
+	return np.divide(shifts, scales)
+
+
+def two_step(row=None, matrix=None, row_i=None, threshold=False):
 	
 	row_assignment = np.zeros(row.shape[0])
 	two_step_agreements = []
 	
 	row_min = row.min(fill_value=np.inf)
-	mins = np.where(row == row_min)[0]
-	if mins.shape[0] == row.shape[0]:
-		print('mins == row???')
-		print(mins)
-		print(row)
-		sys.exit()
-	#print()
-	#print(matrix)
-	#rint()
-	#print(row)
-	#print(row_min)
-	#print()
 	
+	if threshold:
+		assert(type(threshold) == float)
+		assert(threshold < 1.0)
+		
+		upper_bound = row_min * (1 + threshold)
+		
+		diffs = upper_bound - row
+		mins = np.where(diffs > 0)[0]
+	else:
+		mins = np.where(row == row_min)[0]
+	
+	#if mins.shape[0] == row.shape[0]: return None, None
 	
 	for i in mins:
 		col_j = matrix[:,i]
@@ -144,16 +187,16 @@ def two_step(row=None, matrix=None, row_i=None):
 	if len(two_step_agreements) == 0:
 		matrix[row_i,:] = np.ma.masked
 		return row_assignment, matrix
+	
 	row_assignment[two_step_agreements] = 1/len(two_step_agreements) 
 	matrix[row_i,:] = np.ma.masked
 	return row_assignment, matrix
 
 
-def make_assignment(metrics, assignment):
+def make_assignment(metrics, assignment, threshold=False):
 	
 	global_min = metrics.min(fill_value=np.inf)
-	if np.ma.is_masked(global_min):
-		return assignment
+	if np.ma.is_masked(global_min): return assignment
 	
 	globes_ij = np.where(metrics == global_min)
 	
@@ -167,23 +210,27 @@ def make_assignment(metrics, assignment):
 		assign_i, metrics = two_step(
 			row=metrics[rk,:],
 			matrix=metrics,
-			row_i=rk)
+			row_i=rk,
+			threshold=threshold)
 		
-		if assign_i is None: return None
+		if assign_i is None:
+			print('none here')
+			return None
 		assignment[rk,:] = assign_i
 	
 	global_min = metrics.min(fill_value=np.inf)
 	if np.ma.is_masked(global_min): return assignment
-	else:                           return make_assignment(metrics, assignment)
-	
-df = pd.read_pickle(sys.argv[1])
+	else:
+		return make_assignment(metrics, assignment, threshold=threshold)
 
+
+df = pd.read_pickle(sys.argv[1])
 print(df.columns)
 
-preds = df.peaks.tolist()
 
-for i in range(len(preds)):
-	preds[i] = np.zeros(preds[i].shape)
+preds = df.peaks.tolist()
+for i in range(len(preds)): preds[i] = np.zeros(preds[i].shape)
+
 
 df['seq_preds'] = preds
 scale = dict()
@@ -200,143 +247,245 @@ for i in range(4):
 	scale[i] = float(rc_model[1])
 
 print(json.dumps(scale,indent=2))
+scalearr = np.array(list(scale.values()))
 
-
-# for bmrb, predictions in zip(df.bmrbid.tolist(), df.predictions.tolist()):
-# 	print(type(predictions))
-# 	predictions = np.ma.masked_invalid(predictions)
-# 	mat = metric_matrix(predictions, predictions, scale=scale)
-# 	#print(mat)
-# 	mat = mat + np.identity(mat.shape[0])
-# 	zeros = np.where(mat == 0.0)
-# 	print(zeros)
-# 	#sys.exit()
-
-#sys.exit()
 
 seqs_metrics    = []
 shiftx2_metrics = []
-for bmrb, peaks, seq_preds, predictions in zip(
-	df.bmrbid,
+for peaks, s2pred, seqpred in zip(
 	df.peaks.tolist(),
-	df.seq_preds,
-	df.predictions.tolist()):
+	df.predictions.tolist(),
+	df.seq_preds.tolist()
+	):
 	
-	matshiftx2 = metric_matrix(peaks, predictions, scale=scale)
-	matseq     = metric_matrix(peaks, seq_preds, scale=scale)
+	pscale = scale_shifts(peaks, scale=scalearr)
+	predscale = scale_shifts(s2pred, scale=scalearr)
+	seqscale = scale_shifts(seqpred, scale=scalearr)
 	
-	if matshiftx2.mask.all():
-		print(matshiftx2)
-		print(predictions)
-		print(peaks)
-		print(bmrb)
-		sys.exit()
+	pcopy = pscale.copy()
+	pcopy.filled(fill_value=-np.inf)
 	
-	counts = {}
+	numbas2 = numba_for_loop(pcopy, predscale)
+	numbaseq = numba_for_loop(pcopy, seqscale)
 	
-	for i in range(matshiftx2.shape[0]):
-		counts = {}
-		for j in range(matshiftx2.shape[0]):
-			if np.ma.is_masked(matshiftx2[i][j]): continue
-			if np.isnan(matshiftx2[i][j]): continue
-			if matshiftx2[i][j] not in counts: counts[matshiftx2[i][j]] = 0
-			counts[matshiftx2[i][j]] += 1
-			if counts[matshiftx2[i][j]] > 1:
-				#print(matshiftx2[i,:])
-				val = matshiftx2[i][j]
-				wheres = np.where(matshiftx2 == matshiftx2[i][j])
-				print()
-				print(f'bmrbid: {bmrb}')
-				print(f'val: {val}')
-				print(f'row: {matshiftx2[wheres]}')
-				print(f'peaks: {peaks[wheres[0]]}')
-				print(f'predictions: {predictions[wheres[1]]}')
-				print()
-				#sys.exit()
-	
-	shiftx2_metrics.append(matshiftx2)
-	seqs_metrics.append(matseq)
-#sys.exit()
+	shiftx2_metrics.append(numbas2)
+	seqs_metrics.append(numbaseq)
+
 df['shiftx2_matrics'] = shiftx2_metrics
 df['seq_matrices']    = seqs_metrics
 
 
+headers = [
+	'bmrbid',
+	'assignable',
+	'seq raw',
+	'seq % raw',
+	'seq pres.',
+	'seq % pres.',
+	'sx2 raw',
+	'sx2 % raw',
+	'sx2 pres.',
+	'sx2 % pres.'
+]
+thresh = 0.50
+results = []
 for bmrbid, shiftx2, seqm, order in zip(
 	df.bmrbid.tolist(),
 	df.shiftx2_matrics.tolist(),
 	df.seq_matrices.tolist(),
 	df.order.tolist()):
-
+	
+	result = []
+	# mask nans -- some reason they arent getting masked
 	shiftx2 = np.ma.masked_invalid(shiftx2)
 	seqm    = np.ma.masked_invalid(seqm)
 	
-	#print(shiftx2)
-	
-	answers = np.zeros((shiftx2.shape[0], shiftx2.shape[1]))
-	
-	for i, ind in enumerate(order):
-		answers[i, ind] = 1.0
-	
-	
+	# get the mask for the shiftx2 and seqm to apply to answers
 	shiftx2m  = np.ma.getmask(shiftx2).copy()
 	seqm_mask = np.ma.getmask(seqm).copy()
 	
+	# make the correct assignment matrix
+	answers = np.zeros((shiftx2.shape[0], shiftx2.shape[1]))
+	for i, ind in enumerate(order): answers[i, ind] = 1.0
+	shiftx2_answers = np.ma.array(answers, mask=shiftx2m)
+	seqm_answers = np.ma.array(answers, mask=seqm_mask)
+	
+	# get number of assignable rows in assignment matrix
 	shiftx2_assignable =  np.array(
 		[not shiftx2[i,:].mask.all() for i in range(shiftx2.shape[0])])
 	shiftx2_assignable = shiftx2_assignable.sum()
-	
-	shiftx2_answers = np.ma.array(answers, mask=shiftx2m)
-	assignment = np.ma.array(
-		np.zeros((shiftx2.shape[0], shiftx2.shape[1])),
-		mask=shiftx2m)
-	
-	shiftx2_assign = make_assignment(shiftx2, assignment)
-	if shiftx2_assign is None: shiftx2_score = -1
-	shiftx2_score = np.multiply(shiftx2_assign, shiftx2_answers)
-	shiftx2_score = shiftx2_score.sum()
-	
-	#print(shiftx2_assign)
-	print()
-	print(shiftx2_assign.sum(axis=1))
-	#plt.imshow(shiftx2_assign)
-	#plt.show()
-	#print(shiftx2_score)
-	#sys.exit()
 	
 	seqm_assignable = np.array(
 		[not seqm[i,:].mask.all() for i in range(seqm.shape[0])])
 	seqm_assignable = seqm_assignable.sum()
 	
-	seqm_answers = np.ma.array(answers, mask=seqm_mask)
+	# create place holders for the assignment predictions
+	assignment = np.ma.array(
+		np.zeros((shiftx2.shape[0], shiftx2.shape[1])),
+		mask=shiftx2m)
+	
+	# make the shiftx2 assignment prediction and score it
+	shiftx2_assign = make_assignment(shiftx2, assignment, threshold=thresh)
+	if shiftx2_assign is None: shiftx2_score = -1
+	shiftx2_score = np.multiply(shiftx2_assign, shiftx2_answers)
+	shiftx2_score = shiftx2_score.sum()
+	
+	row_scores = np.multiply(shiftx2_assign, shiftx2_answers).sum(axis=1)
+	sx2_pres   = np.where(row_scores > 0)[0].shape[0]
+	#print(sx2_pres)
+	
+	# make the seq-based assignment prediction and score it
 	assignment = np.ma.array(
 		np.zeros((seqm.shape[0], seqm.shape[1])),
-		mask=seqm_mask)
+		mask=seqm_mask)	
 	
-	seqm_assign = make_assignment(seqm, assignment)
+	seqm_assign = make_assignment(seqm, assignment, threshold=thresh)
 	if seqm_assign is None: seqm_score = -1
 	seqm_score = np.multiply(seqm_assign, seqm_answers)
 	seqm_score = seqm_score.sum()
 	
-	print()
-	print('====')
-	print(shiftx2_assignable)
-	print(seqm_assignable)
-	print(f'bmrbid: {bmrbid}')
-	print('>seq models')
-	print(f'score: {seqm_score:.4f}')
-	print(f'% correct: {(seqm_score / seqm_assignable) * 100.0:.4f}')
-	print('>shiftx2 models')
-	print(f'score: {shiftx2_score:.4f}')
-	print(f'% correct: {(shiftx2_score / shiftx2_assignable) * 100.0:.4f}')
-	print('====')
-	print()
+	row_scores = seqm_assign.sum(axis=1)
+	seqm_pres = np.where(row_scores > 0)[0].shape[0]
+	#print(seqm_pres)
 	
-	if shiftx2_assignable == 0:
-		print(shiftx2)
-		sys.exit()
+	result.append(bmrbid)
+	result.append(shiftx2_assignable)
+	result.append(f'{seqm_score:.4f}')
+	result.append(f'{(seqm_score / seqm_assignable) * 100.0:.4f}')
+	result.append(f'{seqm_pres:.4f}')
+	result.append(f'{(seqm_pres / seqm_assignable) * 100.0:.4f}')
+	result.append(f'{shiftx2_score:.4f}')
+	result.append(f'{(shiftx2_score / shiftx2_assignable) * 100.0:.4f}')
+	result.append(f'{sx2_pres:.4f}')
+	result.append(f'{(sx2_pres / shiftx2_assignable) * 100.0:.4f}')
+	
+	results.append(result)
+
+results.sort(key=lambda x: x[1],reverse=True)
+writer = MarkdownTableWriter(
+	table_name='Nearest Assignment Results',
+	headers=headers,
+	value_matrix=results,
+	margin=1,
+	column_styles=[Style(align="center")] * len(headers)
+)
+writer.write_table()
+
+threshold_values = [False, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.9]
+
+results = []
+for bmrbid, shiftx2, order in zip(
+	df.bmrbid.tolist(),
+	df.shiftx2_matrics.tolist(),
+	df.order.tolist()):
+	
+	result = []
+	# mask nans -- some reason they arent getting masked
+	shiftx2 = np.ma.masked_invalid(shiftx2)
+
+	# get the mask for the shiftx2 and seqm to apply to answers
+	shiftx2m  = np.ma.getmask(shiftx2).copy()
+
+	# make the correct assignment matrix
+	answers = np.zeros((shiftx2.shape[0], shiftx2.shape[1]))
+	for i, ind in enumerate(order): answers[i, ind] = 1.0
+	shiftx2_answers = np.ma.array(answers, mask=shiftx2m)
+
+	# get number of assignable rows in assignment matrix
+	shiftx2_assignable =  np.array(
+		[not shiftx2[i,:].mask.all() for i in range(shiftx2.shape[0])])
+	shiftx2_assignable = shiftx2_assignable.sum()
+
+	# create place holders for the assignment predictions
+	assignment = np.ma.array(
+		np.zeros((shiftx2.shape[0], shiftx2.shape[1])),
+		mask=shiftx2m)
+	
+	result.append(bmrbid)
+	result.append(shiftx2_assignable)
+	# make the shiftx2 assignment prediction and score it
+	for t in threshold_values:
+		sx2c = shiftx2.copy()
+		assignment = np.ma.array(
+			np.zeros((shiftx2.shape[0], shiftx2.shape[1])),
+			mask=shiftx2m)
+		shiftx2_assign = make_assignment(sx2c, assignment, threshold=t)
+		if shiftx2_assign is None: shiftx2_score = -1
+		shiftx2_score = np.multiply(shiftx2_assign, shiftx2_answers)
+		shiftx2_score = shiftx2_score.sum()
+		
+		row_scores = np.multiply(shiftx2_assign, shiftx2_answers).sum(axis=1)
+		sx2_pres   = np.where(row_scores > 0)[0].shape[0]
+		
+		line = ''.join((
+			f'{shiftx2_score:.2f}-',
+			f'{(shiftx2_score / shiftx2_assignable) * 100.0:.2f}-',
+			f'{sx2_pres:.2f}-',
+			f'{(sx2_pres / shiftx2_assignable) * 100.0:.2f}'))
+		
+		result.append(line)
+	
+	results.append(result)
+
+headers = [
+	'bmrbid', 'len', 'None', '0.01', '0.1',
+	'0.2', '0.3', '0.4', '0.5', '0.9']
+
+results.sort(key=lambda x: x[1],reverse=True)
+writer = MarkdownTableWriter(
+	table_name='Nearest Assignment Results with thresholding',
+	headers=headers,
+	value_matrix=results,
+	margin=1,
+	column_styles=[Style(align="center")] * len(headers)
+)
+writer.write_table()
+
+
 
 
 """
+	
+		#print(numbas2)
+	#print(matshiftx2)
+	#print(numbas2 - matshiftx2)
+	#print(np.allclose(numbas2, matshiftx2, equal_nan=True))
+	
+	#if not np.allclose(numbas2, matshiftx2, equal_nan=True):
+	#	sys.exit()
+	
+	#print(numbaseq)
+	#print(np.allclose(numbaseq, matseq, equal_nan=True))
+	#if not np.allclose(numbaseq, matseq, equal_nan=True):
+	#	sys.exit()
+	
+	
+	#sys.exit()
+	
+	
+	# if matshiftx2.mask.all():
+# 		print(matshiftx2)
+# 		print(predictions)
+# 		print(peaks)
+# 		print(bmrb)
+# 		sys.exit()
+	
+	#predscale.filled(fill_value=-np.inf)
+	#seqscale.filled(fill_value=-np.inf)
+	#print(pscale.shape)
+	#print(predscale.shape)
+	#sys.exit()
+	
+	#print(type(pcopy))
+
+	#matshiftx2 = metric_matrix(peaks, s2pred, scale=scale)
+	#matseq     = metric_matrix(peaks, seqpred, scale=scale)
+	
+	#sys.exit()
+	#print(peaks)
+	#print(predictions)
+	#print(scalearr)
+
 print(df.predictions[0][25])
 print()
 print(df.peaks[0][25])
@@ -498,13 +647,57 @@ sys.exit()
 	sys.exit()
 
 
+counts = {}
+	
+	for i in range(matshiftx2.shape[0]):
+		counts = {}
+		for j in range(matshiftx2.shape[0]):
+			if np.ma.is_masked(matshiftx2[i][j]): continue
+			if np.isnan(matshiftx2[i][j]): continue
+			if matshiftx2[i][j] not in counts: counts[matshiftx2[i][j]] = 0
+			counts[matshiftx2[i][j]] += 1
+			if counts[matshiftx2[i][j]] > 1:
+				#print(matshiftx2[i,:])
+				val = matshiftx2[i][j]
+				wheres = np.where(matshiftx2 == matshiftx2[i][j])
+				print()
+				print(f'bmrbid: {bmrb}')
+				print(f'val: {val}')
+				print(f'row: {matshiftx2[wheres]}')
+				print(f'peaks: {peaks[wheres[0]]}')
+				print(f'predictions: {predictions[wheres[1]]}')
+				print()
+				#sys.exit()
+
+# for bmrb, predictions in zip(df.bmrbid.tolist(), df.predictions.tolist()):
+# 	print(type(predictions))
+# 	predictions = np.ma.masked_invalid(predictions)
+# 	mat = metric_matrix(predictions, predictions, scale=scale)
+# 	#print(mat)
+# 	mat = mat + np.identity(mat.shape[0])
+# 	zeros = np.where(mat == 0.0)
+# 	print(zeros)
+# 	#sys.exit()
+
+#sys.exit()
 
 
+	#print(shiftx2_assign)
+	print()
+	print(shiftx2_assign.sum(axis=1))
+	#plt.imshow(shiftx2_assign)
+	#plt.show()
+	#print(shiftx2_score)
+	#sys.exit()
 
-
-
-
-
+	# find which rows in the assignment matrix are assignable
+	shiftx2_assignable =  np.array(
+		[not shiftx2[i,:].mask.all() for i in range(shiftx2.shape[0])])
+	shiftx2_assignable = shiftx2_assignable.sum()
+	
+	seqm_assignable = np.array(
+		[not seqm[i,:].mask.all() for i in range(seqm.shape[0])])
+	seqm_assignable = seqm_assignable.sum()
 
 
 """
